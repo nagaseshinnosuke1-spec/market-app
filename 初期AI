@@ -1,0 +1,390 @@
+import { useState, useCallback } from “react”;
+
+// ── palette ──────────────────────────────────────────────
+const C = {
+bg:       “#07090f”,
+surface:  “#0e1420”,
+card:     “#131b2a”,
+border:   “#1c2a40”,
+cyan:     “#00d4ff”,
+green:    “#00ff9d”,
+red:      “#ff3d5a”,
+yellow:   “#ffd700”,
+dim:      “#3d566e”,
+text:     “#aec6e0”,
+bright:   “#e0f0ff”,
+};
+
+// ── helpers ──────────────────────────────────────────────
+const ema = (arr, p) => {
+const k = 2 / (p + 1);
+let v = arr.slice(0, p).reduce((a, b) => a + b, 0) / p;
+for (let i = p; i < arr.length; i++) v = arr[i] * k + v * (1 - k);
+return v;
+};
+
+const rsi = (closes, p = 14) => {
+let g = 0, l = 0;
+for (let i = closes.length - p; i < closes.length; i++) {
+const d = closes[i] - closes[i - 1];
+d > 0 ? (g += d) : (l -= d);
+}
+const rs = g / p / (l / p || 1e-9);
+return 100 - 100 / (1 + rs);
+};
+
+const adxCalc = (candles, p = 14) => {
+const tr = [], pdm = [], mdm = [];
+for (let i = 1; i < candles.length; i++) {
+const { high: h, low: l, close: pc } = { …candles[i], pc: candles[i - 1].close };
+const prevC = candles[i - 1].close;
+tr.push(Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC)));
+const up = h - candles[i - 1].high, dn = candles[i - 1].low - l;
+pdm.push(up > dn && up > 0 ? up : 0);
+mdm.push(dn > up && dn > 0 ? dn : 0);
+}
+const smooth = (a) => {
+let s = a.slice(0, p).reduce((x, y) => x + y, 0);
+const r = [s];
+for (let i = p; i < a.length; i++) { s = s - s / p + a[i]; r.push(s); }
+return r;
+};
+const sTR = smooth(tr), sP = smooth(pdm), sM = smooth(mdm);
+const diP = sP.map((v, i) => (v / sTR[i]) * 100);
+const diM = sM.map((v, i) => (v / sTR[i]) * 100);
+const dx = diP.map((v, i) => Math.abs(v - diM[i]) / ((v + diM[i]) || 1) * 100);
+let adxV = dx.slice(0, p).reduce((a, b) => a + b, 0) / p;
+for (let i = p; i < dx.length; i++) adxV = (adxV * (p - 1) + dx[i]) / p;
+return { adx: adxV, diP: diP[diP.length - 1], diM: diM[diM.length - 1] };
+};
+
+const bbWidth = (closes, p = 20) => {
+const sl = closes.slice(-p);
+const m = sl.reduce((a, b) => a + b) / p;
+const std = Math.sqrt(sl.reduce((a, b) => a + (b - m) ** 2, 0) / p);
+return (std * 2) / m * 100;
+};
+
+const atrCalc = (candles, p = 14) => {
+const trs = [];
+for (let i = 1; i < candles.length; i++) {
+const { high: h, low: l } = candles[i], pc = candles[i - 1].close;
+trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+}
+return trs.slice(-p).reduce((a, b) => a + b) / p;
+};
+
+function analyzeMarket(candles) {
+const closes = candles.map(c => c.close);
+const { adx, diP, diM } = adxCalc(candles);
+const bb = bbWidth(closes);
+const r = rsi(closes);
+const e20 = ema(closes, 20);
+const e50 = ema(closes, 50);
+const atr = atrCalc(candles);
+const price = closes[closes.length - 1];
+const change = ((price - closes[closes.length - 25]) / closes[closes.length - 25]) * 100;
+const emaDiff = Math.abs((e20 - e50) / e50) * 100;
+const atrPct = atr / price * 100;
+
+let regime = “range”, conf = 55;
+if (adx > 30 && bb > 2.5) {
+regime = diP > diM ? “up” : “down”;
+conf = Math.min(94, 60 + (adx - 30) * 1.5);
+} else if (adx > 22 && Math.abs(change) > 3) {
+regime = change > 0 ? “up” : “down”;
+conf = Math.min(80, 55 + Math.abs(change) * 2);
+} else {
+conf = Math.min(90, 62 + (24 - Math.min(adx, 24)) * 1.2);
+}
+
+return {
+regime, conf: Math.max(45, conf),
+adx: adx.toFixed(1), diP: diP.toFixed(1), diM: diM.toFixed(1),
+bb: bb.toFixed(2), rsi: r.toFixed(1),
+e20: e20.toFixed(2), e50: e50.toFixed(2),
+emaDiff: emaDiff.toFixed(2), atrPct: atrPct.toFixed(3),
+price, change: change.toFixed(2),
+};
+}
+
+// ── Claude AI call ────────────────────────────────────────
+async function callAI(d, symbol, interval) {
+const regimeJa = d.regime === “range” ? “レンジ相場” : d.regime === “up” ? “上昇トレンド” : “下降トレンド”;
+const prompt = `あなたはプロの仮想通貨トレーダーです。以下のデータを元に相場を分析してください。
+
+通貨: ${symbol} / 時間足: ${interval}
+判定: ${regimeJa}（確信度${d.conf.toFixed(0)}%）
+ADX: ${d.adx} | DI+: ${d.diP} DI-: ${d.diM}
+BB幅: ${d.bb}% | RSI: ${d.rsi}
+EMA20: $${d.e20} / EMA50: $${d.e50} | 乖離: ${d.emaDiff}%
+ATR比率: ${d.atrPct}% | 価格変化: ${d.change}%
+現在値: $${d.price.toLocaleString()}
+
+①判断根拠 ②いま注目すべき点 ③相場転換のサインを、合計250〜320字で簡潔にプロらしく解説してください。`;
+
+const res = await fetch(“https://api.anthropic.com/v1/messages”, {
+method: “POST”,
+headers: { “Content-Type”: “application/json” },
+body: JSON.stringify({
+model: “claude-sonnet-4-20250514”,
+max_tokens: 1000,
+messages: [{ role: “user”, content: prompt }],
+}),
+});
+if (!res.ok) throw new Error(“AI APIエラー”);
+const data = await res.json();
+return data.content[0].text;
+}
+
+// ── sub-components ────────────────────────────────────────
+const Spinner = () => (
+
+  <div style={{ display: "flex", alignItems: "center", gap: 10, color: C.dim, fontSize: 12, letterSpacing: "0.08em" }}>
+    <div style={{
+      width: 16, height: 16, borderRadius: "50%",
+      border: `2px solid ${C.border}`, borderTopColor: C.cyan,
+      animation: "spin 0.8s linear infinite",
+    }} />
+    処理中…
+  </div>
+);
+
+const Tag = ({ color, children }) => (
+<span style={{
+background: color + “18”, border: `1px solid ${color}40`,
+color, borderRadius: 3, padding: “2px 8px”, fontSize: 11,
+letterSpacing: “0.05em”, fontWeight: 600,
+}}>{children}</span>
+);
+
+const Metric = ({ label, value, color }) => (
+
+  <div style={{
+    background: C.card, border: `1px solid ${C.border}`,
+    borderRadius: 8, padding: "14px 16px", flex: 1, minWidth: 90,
+  }}>
+    <div style={{ fontSize: 9, color: C.dim, letterSpacing: "0.2em", marginBottom: 8, textTransform: "uppercase" }}>{label}</div>
+    <div style={{ fontSize: 22, fontWeight: 700, color: color || C.bright, fontVariantNumeric: "tabular-nums" }}>{value}</div>
+  </div>
+);
+
+const IndicatorRow = ({ label, value, signal }) => {
+const col = signal === “bull” ? C.green : signal === “bear” ? C.red : C.yellow;
+return (
+<div style={{ display: “flex”, justifyContent: “space-between”, alignItems: “center”, padding: “9px 0”, borderBottom: `1px solid ${C.border}22` }}>
+<span style={{ fontSize: 12, color: C.dim }}>{label}</span>
+<span style={{ fontSize: 12, fontWeight: 600, color: col }}>{value}</span>
+</div>
+);
+};
+
+const RegimeBanner = ({ regime, conf }) => {
+const cfg = {
+range: { color: C.yellow, icon: “⇌”, label: “レンジ相場”, sub: “方向感なし・逆張り有効” },
+up:    { color: C.green,  icon: “▲”, label: “上昇トレンド”, sub: “押し目買い局面” },
+down:  { color: C.red,   icon: “▼”, label: “下降トレンド”, sub: “戻り売り局面” },
+}[regime] || { color: C.dim, icon: “◌”, label: “待機中”, sub: “分析前” };
+
+return (
+<div style={{
+background: cfg.color + “0d”,
+border: `1px solid ${cfg.color}55`,
+borderRadius: 12, padding: “20px 20px 16px”,
+boxShadow: `0 0 30px ${cfg.color}12`,
+}}>
+<div style={{ display: “flex”, alignItems: “center”, gap: 12, marginBottom: 12 }}>
+<span style={{ fontSize: 36, lineHeight: 1 }}>{cfg.icon}</span>
+<div>
+<div style={{ fontSize: 18, fontWeight: 800, color: cfg.color, letterSpacing: “0.05em” }}>{cfg.label}</div>
+<div style={{ fontSize: 12, color: C.dim, marginTop: 2 }}>{cfg.sub}</div>
+</div>
+</div>
+{/* confidence bar */}
+<div style={{ display: “flex”, alignItems: “center”, gap: 10 }}>
+<div style={{ flex: 1, height: 4, background: C.border, borderRadius: 2, overflow: “hidden” }}>
+<div style={{ width: conf + “%”, height: “100%”, background: cfg.color, borderRadius: 2, transition: “width 1s ease” }} />
+</div>
+<span style={{ fontSize: 11, color: cfg.color, fontWeight: 700, minWidth: 40 }}>確信度 {conf.toFixed(0)}%</span>
+</div>
+</div>
+);
+};
+
+// ── main component ────────────────────────────────────────
+export default function App() {
+const [symbol, setSymbol] = useState(“BTCUSDT”);
+const [interval, setInterval] = useState(“1h”);
+const [loading, setLoading] = useState(false);
+const [result, setResult] = useState(null);
+const [aiText, setAiText] = useState(””);
+const [error, setError] = useState(””);
+const [phase, setPhase] = useState(””); // “fetch” | “ai”
+
+const run = useCallback(async () => {
+setLoading(true); setError(””); setResult(null); setAiText(””); setPhase(“fetch”);
+try {
+const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=200`;
+const res = await fetch(url);
+if (!res.ok) throw new Error(`Binance APIエラー (${res.status})`);
+const raw = await res.json();
+const candles = raw.map(k => ({
+open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
+}));
+const d = analyzeMarket(candles);
+setResult(d);
+setPhase(“ai”);
+const text = await callAI(d, symbol, interval);
+setAiText(text);
+} catch (e) {
+setError(e.message);
+} finally {
+setLoading(false); setPhase(””);
+}
+}, [symbol, interval]);
+
+const sel = (value, onChange, opts) => (
+<select value={value} onChange={e => onChange(e.target.value)} style={{
+flex: 1, background: C.card, border: `1px solid ${C.border}`,
+color: C.text, padding: “11px 12px”, borderRadius: 8, fontSize: 14,
+fontFamily: “inherit”, outline: “none”, appearance: “none”,
+backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%233d566e' stroke-width='2' fill='none'/%3E%3C/svg%3E")`,
+backgroundRepeat: “no-repeat”, backgroundPosition: “right 12px center”,
+}}>
+{opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+</select>
+);
+
+const strategies = result ? (
+result.regime === “range”
+? [
+[“📊 レンジ戦略”, `EMA20（$${result.e20}）付近でロング、レジスタンスでショート。ADX ${result.adx}と低くトレンドなし。`],
+[“⚡ ブレイク警戒”, `BB幅${result.bb}%。拡張し始めたらトレンド転換サイン。出来高急増に注意。`],
+[“🎯 RSI活用”, `RSI ${result.rsi}。30以下で買い・70以上で売りシグナルが機能しやすい局面。`],
+]
+: result.regime === “up”
+? [
+[“📈 押し目買い”, `EMA20（$${result.e20}）タッチでエントリー。DI+${result.diP} > DI-${result.diM}で上昇優勢。`],
+[“🛡 損切り目安”, `EMA50（$${result.e50}）割れで撤退。ADX ${result.adx}のトレンド継続中。`],
+[“💰 利確戦略”, `強いトレンド中はトレーリングストップで利益を伸ばすのが有効。`],
+]
+: [
+[“📉 戻り売り”, `EMA20（$${result.e20}）反落でショートエントリー。DI-${result.diM} > DI+${result.diP}。`],
+[“🛡 損切り目安”, `EMA50（$${result.e50}）上抜けで撤退。ADX ${result.adx}の下降トレンド。`],
+[“💡 ファンディング”, `下降トレンド時はファンディングレートがマイナスになりやすく、ショートに有利。`],
+]
+) : [];
+
+return (
+<div style={{ background: C.bg, minHeight: “100vh”, fontFamily: “‘DM Mono’, ‘Courier New’, monospace”, color: C.text }}>
+<style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&display=swap'); @keyframes spin { to { transform: rotate(360deg); } } * { box-sizing: border-box; } ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: #1c2a40; }`}</style>
+
+```
+  {/* Header */}
+  <div style={{ padding: "18px 20px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+    <div>
+      <div style={{ fontSize: 13, fontWeight: 700, color: C.cyan, letterSpacing: "0.25em" }}>AI REGIME</div>
+      <div style={{ fontSize: 10, color: C.dim, letterSpacing: "0.15em" }}>DETECTOR</div>
+    </div>
+    <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: C.dim }}>
+      <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.green, boxShadow: `0 0 6px ${C.green}`, animation: "spin 4s linear infinite" }} />
+      BINANCE LIVE
+    </div>
+  </div>
+
+  <div style={{ padding: "20px 16px", display: "flex", flexDirection: "column", gap: 16, maxWidth: 540, margin: "0 auto" }}>
+
+    {/* Controls */}
+    <div style={{ display: "flex", gap: 10 }}>
+      {sel(symbol, setSymbol, [["BTCUSDT","BTC/USDT"],["ETHUSDT","ETH/USDT"],["SOLUSDT","SOL/USDT"],["XRPUSDT","XRP/USDT"],["BNBUSDT","BNB/USDT"],["DOGEUSDT","DOGE/USDT"]])}
+      {sel(interval, setInterval, [["15m","15分足"],["1h","1時間足"],["4h","4時間足"],["1d","日足"]])}
+    </div>
+
+    <button onClick={run} disabled={loading} style={{
+      background: loading ? C.border : `linear-gradient(135deg, ${C.cyan}22, ${C.cyan}0d)`,
+      border: `1px solid ${loading ? C.dim : C.cyan}`,
+      color: loading ? C.dim : C.cyan,
+      padding: "14px", borderRadius: 8, fontSize: 13, fontFamily: "inherit",
+      fontWeight: 700, letterSpacing: "0.2em", cursor: loading ? "not-allowed" : "pointer",
+      transition: "all 0.2s",
+    }}>
+      {loading ? (phase === "fetch" ? "📡 データ取得中..." : "🤖 AI分析中...") : "▶  AI 分析 START"}
+    </button>
+
+    {error && <div style={{ color: C.red, fontSize: 12, background: C.red + "10", border: `1px solid ${C.red}30`, borderRadius: 8, padding: 14 }}>⚠ {error}</div>}
+
+    {/* Regime banner */}
+    {result && <RegimeBanner regime={result.regime} conf={result.conf} />}
+
+    {/* Price metrics */}
+    {result && (
+      <div style={{ display: "flex", gap: 10 }}>
+        <Metric label="現在価格" value={
+          result.price > 1000 ? "$" + Math.round(result.price).toLocaleString() :
+          result.price > 1 ? "$" + parseFloat(result.price).toFixed(4) :
+          "$" + result.price.toFixed(5)
+        } color={C.cyan} />
+        <Metric label="変化率" value={(parseFloat(result.change) >= 0 ? "+" : "") + result.change + "%"}
+          color={parseFloat(result.change) >= 0 ? C.green : C.red} />
+        <Metric label="ADX" value={result.adx}
+          color={parseFloat(result.adx) > 30 ? C.green : parseFloat(result.adx) > 20 ? C.yellow : C.red} />
+      </div>
+    )}
+
+    {/* Indicators */}
+    {result && (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 18px" }}>
+        <div style={{ fontSize: 9, color: C.dim, letterSpacing: "0.2em", marginBottom: 12, textTransform: "uppercase" }}>テクニカル指標</div>
+        <IndicatorRow label="ADX（トレンド強度）" value={result.adx} signal={+result.adx > 30 ? "bull" : +result.adx > 20 ? "neutral" : "bear"} />
+        <IndicatorRow label="DI+ / DI−" value={`${result.diP} / ${result.diM}`} signal={+result.diP > +result.diM ? "bull" : "bear"} />
+        <IndicatorRow label="BBバンド幅" value={result.bb + "%"} signal={+result.bb > 3 ? "bull" : "neutral"} />
+        <IndicatorRow label="RSI" value={result.rsi} signal={+result.rsi > 60 ? "bull" : +result.rsi < 40 ? "bear" : "neutral"} />
+        <IndicatorRow label="EMA20 / EMA50" value={`$${result.e20} / $${result.e50}`} signal={+result.e20 > +result.e50 ? "bull" : "bear"} />
+        <IndicatorRow label="ATRボラティリティ" value={result.atrPct + "%"} signal="neutral" />
+      </div>
+    )}
+
+    {/* AI analysis */}
+    {(loading && phase === "ai") && (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
+        <div style={{ fontSize: 9, color: C.dim, letterSpacing: "0.2em", marginBottom: 14, textTransform: "uppercase" }}>AI 分析</div>
+        <Spinner />
+      </div>
+    )}
+    {aiText && (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <div style={{ fontSize: 9, color: C.dim, letterSpacing: "0.2em", textTransform: "uppercase" }}>AI 相場分析</div>
+          <Tag color={C.cyan}>Claude AI</Tag>
+        </div>
+        <div style={{ fontSize: 13, lineHeight: 1.9, color: C.text, whiteSpace: "pre-wrap" }}>{aiText}</div>
+      </div>
+    )}
+
+    {/* Strategies */}
+    {result && strategies.length > 0 && (
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18 }}>
+        <div style={{ fontSize: 9, color: C.dim, letterSpacing: "0.2em", marginBottom: 14, textTransform: "uppercase" }}>推奨ストラテジー</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {strategies.map(([title, body], i) => (
+            <div key={i} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: "14px 16px" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.cyan, marginBottom: 6, letterSpacing: "0.05em" }}>{title}</div>
+              <div style={{ fontSize: 12, lineHeight: 1.7, color: C.text }}>{body}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {!result && !loading && (
+      <div style={{ textAlign: "center", color: C.dim, fontSize: 12, padding: "32px 0", lineHeight: 2 }}>
+        通貨ペアと時間足を選んで<br />「AI 分析 START」をタップ
+      </div>
+    )}
+
+  </div>
+</div>
+```
+
+);
+}
